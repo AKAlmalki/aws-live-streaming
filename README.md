@@ -2,6 +2,8 @@
 
 This project provisions and demonstrates two end-to-end AWS live streaming workflows:
 
+![Web Player Loading a Stream](assets/screenshot-for-web-player-running-stream.png)
+
 - Ingest with AWS MediaConnect over SRT
 - Transcode with AWS MediaLive into ABR H.264 (1080p/720p/480p)
 - Package with AWS MediaPackage:
@@ -13,6 +15,8 @@ This project provisions and demonstrates two end-to-end AWS live streaming workf
 ## Architecture
 
 High-Level View Architecture Diagram
+
+![AWS High-Level View Architecture Diagram](assets/AWS%20Media%20Streaming%20Pipeline%20-%20High-Level%20View%20Architecture%20Diagram.png)
 
 ## Project Structure
 
