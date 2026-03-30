@@ -18,6 +18,8 @@ High-Level View Architecture Diagram
 
 ![AWS High-Level View Architecture Diagram](assets/AWS%20Media%20Streaming%20Pipeline%20-%20High-Level%20View%20Architecture%20Diagram.png)
 
+![AWS Detailed View Architecture Diagram](assets/AWS%20Media%20Streaming%20Pipeline%20-%20Detailed%20Architecture%20View.png)
+
 ## Project Structure
 
 - `terraform-hls/main.tf` - core HLS pipeline (MediaPackage v1)
