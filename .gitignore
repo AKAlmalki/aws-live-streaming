@@ -1,0 +1,39 @@
+# Private assignment source files (not part of the public repository)
+تكليف شاغر«streaming Engineer ».docx
+تكليف شاغر«streaming Engineer ».md
+PROJECT_OVERVIEW_AR.md
+
+# Terraform — local plugins, state (never commit state to GitHub)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+terraform.rc
+*.tfplan
+tfplan
+
+# If terraform.tfvars ever contains secrets, uncomment:
+# terraform.tfvars
+# *.auto.tfvars
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / temp
+*.swp
+*.swo
+*~
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Misc logs
+*.log

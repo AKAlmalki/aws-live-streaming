@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Streaming Project Player</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Arial, sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 1rem;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    .container {
+      max-width: 980px;
+      margin: 0 auto;
+      display: grid;
+      gap: 0.9rem;
+    }
+    h1 {
+      font-size: 1.25rem;
+      margin: 0;
+    }
+    .controls {
+      display: grid;
+      gap: 0.5rem;
+      grid-template-columns: 1fr auto;
+    }
+    input {
+      padding: 0.55rem 0.6rem;
+      border-radius: 6px;
+      border: 1px solid #334155;
+      background: #111827;
+      color: #e2e8f0;
+    }
+    button {
+      padding: 0.55rem 0.8rem;
+      border-radius: 6px;
+      border: 1px solid #1d4ed8;
+      background: #2563eb;
+      color: white;
+      cursor: pointer;
+    }
+    video {
+      width: 100%;
+      border-radius: 8px;
+      background: black;
+    }
+    .panel {
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 0.75rem;
+      background: #111827;
+      font-family: Consolas, monospace;
+      white-space: pre-wrap;
+      font-size: 0.9rem;
+      line-height: 1.35;
+    }
+    .grid {
+      display: grid;
+      gap: 0.75rem;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+    .metricTitle {
+      font-weight: 700;
+      margin-bottom: 0.35rem;
+    }
+    .hint {
+      font-size: 0.9rem;
+      color: #94a3b8;
+      margin: 0;
+    }
+    .modeRow {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 0.25rem;
+    }
+    .modeRow label {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>AWS Live Streaming Player (Hls.js)</h1>
+    <p class="hint">
+      Pass a playback URL with <code>?url=https://.../index.m3u8</code>
+      or pass both manifests for a toggle:
+      <code>?hls=https://.../index.m3u8&amp;ll=https://.../index_ll.m3u8</code>
+    </p>
+    <div class="controls">
+      <input id="manifestUrl" type="text" placeholder="https://example.cloudfront.net/index.m3u8" />
+      <button id="playBtn" type="button">Load Stream</button>
+    </div>
+    <div class="modeRow" aria-label="Playback mode toggle">
+      <label><input type="radio" name="latencyMode" value="hls" checked /> Standard HLS</label>
+      <label><input type="radio" name="latencyMode" value="llhls" /> LL-HLS</label>
+    </div>
+    <video id="video" controls autoplay muted playsinline></video>
+    <div class="grid">
+      <div id="status" class="panel">Status: waiting for manifest URL...</div>
+      <div id="analytics" class="panel">Analytics: waiting for playback...</div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
+  <script>
+    const video = document.getElementById("video");
+    const manifestInput = document.getElementById("manifestUrl");
+    const playBtn = document.getElementById("playBtn");
+    const statusEl = document.getElementById("status");
+    const analyticsEl = document.getElementById("analytics");
+    let hls;
+    let currentLevelInfo = "unknown";
+    let analyticsTimer = null;
+
+    const stats = {
+      startedAtMs: null,
+      lastFragLoadedAtMs: null,
+      playlistReloads: 0,
+      fragmentLoads: 0,
+      estimatedThroughputKbps: 0,
+      errorFatal: 0,
+      errorRecoverable: 0,
+      stalls: 0,
+      droppedFrames: 0,
+      totalFrames: 0,
+    };
+
+    const getSelectedMode = () => {
+      const selected = document.querySelector('input[name="latencyMode"]:checked');
+      return selected ? selected.value : "hls";
+    };
+
+    const formatBitrate = (bps) => {
+      if (!bps || Number.isNaN(bps)) return "unknown";
+      if (bps >= 1000000) return `${(bps / 1000000).toFixed(2)} Mbps`;
+      return `${Math.round(bps / 1000)} Kbps`;
+    };
+
+    const updateStatus = (message) => {
+      const playbackQuality = `CurrentABR: ${currentLevelInfo}`;
+      statusEl.textContent = `Status: ${message}\n${playbackQuality}`;
+    };
+
+    const formatSeconds = (v) => {
+      if (!Number.isFinite(v) || v < 0) return "n/a";
+      return `${v.toFixed(2)}s`;
+    };
+
+    const formatNumber = (v) => {
+      if (!Number.isFinite(v)) return "n/a";
+      return `${Math.round(v)}`;
+    };
+
+    const renderAnalytics = () => {
+      const mode = getSelectedMode() === "llhls" ? "LL-HLS" : "Standard HLS";
+      const nowMs = Date.now();
+      const uptimeSec = stats.startedAtMs ? (nowMs - stats.startedAtMs) / 1000 : NaN;
+
+      let latencySec = NaN;
+      let liveEdgeGapSec = NaN;
+      if (hls && typeof hls.latency === "number") latencySec = hls.latency;
+      if (hls && typeof hls.liveSyncPosition === "number" && Number.isFinite(video.currentTime)) {
+        liveEdgeGapSec = hls.liveSyncPosition - video.currentTime;
+      }
+
+      const bufferedAheadSec = (video.buffered && video.buffered.length > 0)
+        ? video.buffered.end(video.buffered.length - 1) - video.currentTime
+        : NaN;
+
+      const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+      if (quality) {
+        stats.droppedFrames = quality.droppedVideoFrames || 0;
+        stats.totalFrames = quality.totalVideoFrames || 0;
+      }
+      const droppedRatio = stats.totalFrames > 0 ? (stats.droppedFrames / stats.totalFrames) * 100 : NaN;
+
+      analyticsEl.textContent =
+`Mode: ${mode}
+Uptime: ${formatSeconds(uptimeSec)}
+Estimated latency (hls.js): ${formatSeconds(latencySec)}
+Live edge gap: ${formatSeconds(liveEdgeGapSec)}
+Buffer ahead: ${formatSeconds(bufferedAheadSec)}
+Throughput estimate: ${formatNumber(stats.estimatedThroughputKbps)} Kbps
+Playlist reloads: ${stats.playlistReloads}
+Fragment loads: ${stats.fragmentLoads}
+Stalls: ${stats.stalls}
+Errors (fatal/recoverable): ${stats.errorFatal}/${stats.errorRecoverable}
+Dropped frames: ${stats.droppedFrames}/${stats.totalFrames} (${Number.isFinite(droppedRatio) ? droppedRatio.toFixed(2) : "n/a"}%)
+Last fragment load age: ${stats.lastFragLoadedAtMs ? formatSeconds((Date.now() - stats.lastFragLoadedAtMs) / 1000) : "n/a"}`;
+    };
+
+    const startAnalyticsTimer = () => {
+      if (analyticsTimer) clearInterval(analyticsTimer);
+      analyticsTimer = setInterval(renderAnalytics, 1000);
+    };
+
+    const setCurrentLevel = (levelObj, levelIndex) => {
+      if (!levelObj) {
+        currentLevelInfo = "auto / not selected yet";
+        return;
+      }
+      const height = levelObj.height ? `${levelObj.height}p` : "unknown-res";
+      const bitrate = formatBitrate(levelObj.bitrate);
+      currentLevelInfo = `level=${levelIndex}, resolution=${height}, bitrate=${bitrate}`;
+    };
+
+    const loadStream = (url) => {
+      if (!url) {
+        updateStatus("enter a valid HLS URL first.");
+        return;
+      }
+
+      const mode = getSelectedMode();
+      const isLLHls = mode === "llhls";
+
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      if (analyticsTimer) {
+        clearInterval(analyticsTimer);
+        analyticsTimer = null;
+      }
+      stats.startedAtMs = Date.now();
+      stats.lastFragLoadedAtMs = null;
+      stats.playlistReloads = 0;
+      stats.fragmentLoads = 0;
+      stats.estimatedThroughputKbps = 0;
+      stats.errorFatal = 0;
+      stats.errorRecoverable = 0;
+      stats.stalls = 0;
+      stats.droppedFrames = 0;
+      stats.totalFrames = 0;
+
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = url;
+        updateStatus(`native HLS playback (Safari/compatible browser). Mode: ${isLLHls ? "LL-HLS" : "Standard HLS"}`);
+        startAnalyticsTimer();
+        video.play().catch(() => {
+          updateStatus("native HLS: tap play if autoplay was blocked.");
+        });
+        return;
+      }
+
+      if (!window.Hls || !window.Hls.isSupported()) {
+        updateStatus("HLS is not supported in this browser.");
+        return;
+      }
+
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: isLLHls,
+        liveDurationInfinity: true,
+        liveSyncDurationCount: isLLHls ? 1 : 3,
+        liveMaxLatencyDurationCount: isLLHls ? 10 : 30,
+        maxLiveSyncPlaybackRate: isLLHls ? 1.2 : 1.5,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 120,
+        startLevel: -1,
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+        updateStatus(`manifest loaded, quality levels: ${data.levels.length}`);
+        startAnalyticsTimer();
+        video.play().catch(() => {
+          updateStatus("manifest ready — tap play if autoplay was blocked.");
+        });
+      });
+
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+        const level = hls.levels[data.level];
+        setCurrentLevel(level, data.level);
+        updateStatus("playback started.");
+      });
+
+      hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+        const level = hls.levels[data.level];
+        setCurrentLevel(level, data.level);
+        stats.playlistReloads += 1;
+        updateStatus(`playlist refreshed: ${data.details.live ? "LIVE" : "VOD"}`);
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+        stats.fragmentLoads += 1;
+        stats.lastFragLoadedAtMs = Date.now();
+        const ms = data.stats?.loading?.end && data.stats?.loading?.first ? (data.stats.loading.end - data.stats.loading.first) : 0;
+        if (ms > 0 && data.frag?.loaded) {
+          const kbps = (data.frag.loaded * 8) / ms;
+          stats.estimatedThroughputKbps = kbps;
+        }
+      });
+
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) {
+          stats.errorFatal += 1;
+          updateStatus(`fatal error: ${data.type} / ${data.details}`);
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            hls.destroy();
+            hls = null;
+          }
+        } else if (data.details === "bufferStalledError") {
+          stats.stalls += 1;
+          stats.errorRecoverable += 1;
+          updateStatus("buffer stalled — catching up to live edge...");
+        } else {
+          stats.errorRecoverable += 1;
+          updateStatus(`recoverable error: ${data.type} / ${data.details}`);
+        }
+      });
+
+      hls.loadSource(url);
+      hls.attachMedia(video);
+    };
+
+    playBtn.addEventListener("click", () => loadStream(manifestInput.value.trim()));
+    video.addEventListener("waiting", () => {
+      stats.stalls += 1;
+    });
+
+    const params = new URLSearchParams(window.location.search);
+    const urlParam = params.get("url");
+    const hlsUrlParam = params.get("hls");
+    const llUrlParam = params.get("ll");
+
+    const applyModePresetToInput = () => {
+      const mode = getSelectedMode();
+      if (mode === "hls" && hlsUrlParam) manifestInput.value = hlsUrlParam;
+      if (mode === "llhls" && llUrlParam) manifestInput.value = llUrlParam;
+    };
+
+    // If we got explicit URLs, drive the toggle from them.
+    if (hlsUrlParam || llUrlParam) {
+      applyModePresetToInput();
+      document.querySelectorAll('input[name="latencyMode"]').forEach((el) => {
+        el.addEventListener("change", applyModePresetToInput);
+      });
+    }
+
+    // Backwards compatibility: if ?url= is provided, load it directly.
+    if (urlParam) {
+      manifestInput.value = urlParam;
+      if (urlParam.includes("index_ll") || urlParam.includes("indexll")) {
+        document.querySelector('input[name="latencyMode"][value="llhls"]').checked = true;
+      }
+      loadStream(urlParam);
+    }
+  </script>
+</body>
+</html>
