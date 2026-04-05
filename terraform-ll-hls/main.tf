@@ -55,6 +55,30 @@ locals {
   media_package_path_parts    = split("/", local.media_package_url_no_scheme)
   media_package_origin_domain = local.media_package_path_parts[0]
   media_package_origin_path   = "/${join("/", slice(local.media_package_path_parts, 1, length(local.media_package_path_parts) - 1))}"
+
+  channel_policy_json = jsonencode({
+    Version = "2012-10-17"
+    Id      = "AllowMediaLiveChannelToIngestToEmpChannel"
+    Statement = [{
+      Sid       = "AllowMediaLiveRoleToAccessEmpChannel"
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_role.medialive.arn }
+      Action    = "mediapackagev2:PutObject"
+      Resource  = "arn:aws:mediapackagev2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:channelGroup/${local.name_prefix}-cg/channel/${local.name_prefix}-ch"
+    }]
+  })
+
+  origin_endpoint_policy_json = jsonencode({
+    Version = "2012-10-17"
+    Id      = "AnonymousAccessPolicy"
+    Statement = [{
+      Sid       = "AllowAnonymousAccess"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "mediapackagev2:GetObject"
+      Resource  = "arn:aws:mediapackagev2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:channelGroup/${local.name_prefix}-cg/channel/${local.name_prefix}-ch/originEndpoint/${local.name_prefix}-ep"
+    }]
+  })
 }
 
 #################
@@ -230,39 +254,6 @@ resource "aws_cloudformation_stack" "mediapackage_v2" {
         }
       }
 
-      # Allow MediaLive role to ingest CMAF objects into the MediaPackage v2 channel.
-      ChannelPolicy = {
-        Type = "AWS::MediaPackageV2::ChannelPolicy"
-        DependsOn = [
-          "Channel"
-        ]
-        Properties = {
-          ChannelGroupName = "${local.name_prefix}-cg"
-          ChannelName      = "${local.name_prefix}-ch"
-          # Must match IAM policy shape expected by PutChannelPolicy (Principal as { "AWS": "..." }, not "*").
-          Policy = {
-            Version = "2012-10-17"
-            Id      = "AllowMediaLiveChannelToIngestToEmpChannel"
-            Statement = [
-              {
-                Sid    = "AllowMediaLiveRoleToAccessEmpChannel"
-                Effect = "Allow"
-                Principal = {
-                  AWS = aws_iam_role.medialive.arn
-                }
-                Action   = "mediapackagev2:PutObject"
-                Resource = format(
-                  "arn:aws:mediapackagev2:%s:%s:channelGroup/%s-cg/channel/%s-ch",
-                  var.aws_region,
-                  data.aws_caller_identity.current.account_id,
-                  local.name_prefix,
-                  local.name_prefix
-                )
-              }
-            ]
-          }
-        }
-      }
       OriginEndpoint = {
         Type = "AWS::MediaPackageV2::OriginEndpoint"
         DependsOn = [
@@ -279,56 +270,21 @@ resource "aws_cloudformation_stack" "mediapackage_v2" {
           }
           HlsManifests = [
             {
-              ManifestName          = "index"
-              ManifestWindowSeconds = var.hls_playlist_window_seconds
+              ManifestName                   = "index"
+              ManifestWindowSeconds          = var.hls_playlist_window_seconds
+              ProgramDateTimeIntervalSeconds = 1
             }
           ]
           LowLatencyHlsManifests = [
             {
-              ManifestName          = "indexll"
-              ManifestWindowSeconds = var.hls_playlist_window_seconds
+              ManifestName                   = "indexll"
+              ManifestWindowSeconds          = var.hls_playlist_window_seconds
+              ProgramDateTimeIntervalSeconds = 1
             }
           ]
         }
       }
 
-      # MediaPackage v2 endpoints are denied by default unless a resource policy allows reads.
-      OriginEndpointPolicy = {
-        Type = "AWS::MediaPackageV2::OriginEndpointPolicy"
-        DependsOn = [
-          "OriginEndpoint"
-        ]
-        Properties = {
-          ChannelGroupName  = "${local.name_prefix}-cg"
-          ChannelName       = "${local.name_prefix}-ch"
-          OriginEndpointName = "${local.name_prefix}-ep"
-          Policy = {
-            Version = "2012-10-17"
-            Statement = [
-              {
-                Sid    = "AllowPublicReadForDemo"
-                Effect = "Allow"
-                # Anonymous read: use { "AWS": "*" } — bare "*" is rejected by the policy validator.
-                Principal = {
-                  AWS = "*"
-                }
-                Action = [
-                  "mediapackagev2:GetObject",
-                  "mediapackagev2:GetHeadObject"
-                ]
-                Resource = format(
-                  "arn:aws:mediapackagev2:%s:%s:channelGroup/%s-cg/channel/%s-ch/originEndpoint/%s-ep",
-                  var.aws_region,
-                  data.aws_caller_identity.current.account_id,
-                  local.name_prefix,
-                  local.name_prefix,
-                  local.name_prefix
-                )
-              }
-            ]
-          }
-        }
-      }
     }
     Outputs = {
       HlsManifestUrl = {
@@ -341,6 +297,11 @@ resource "aws_cloudformation_stack" "mediapackage_v2" {
           "Fn::Select" = [0, { "Fn::GetAtt" = ["OriginEndpoint", "LowLatencyHlsManifestUrls"] }]
         }
       }
+      IngestUrl = {
+        Value = {
+          "Fn::Select" = [0, { "Fn::GetAtt" = ["Channel", "IngestEndpointUrls"] }]
+        }
+      }
       ChannelGroupName = {
         Value = "${local.name_prefix}-cg"
       }
@@ -351,6 +312,30 @@ resource "aws_cloudformation_stack" "mediapackage_v2" {
   })
 
   tags = var.default_tags
+}
+
+#################
+# MediaPackage v2 resource policies (applied via AWS CLI to bypass CloudFormation Json-type serialisation issues)
+#################
+
+resource "terraform_data" "channel_policy" {
+  depends_on = [aws_cloudformation_stack.mediapackage_v2]
+  triggers_replace = [local.channel_policy_json]
+
+  provisioner "local-exec" {
+    interpreter = ["PowerShell", "-Command"]
+    command     = "[IO.File]::WriteAllText('${abspath(path.module)}/.tmp-ch-policy.json', '${replace(local.channel_policy_json, "'", "''")}'); aws mediapackagev2 put-channel-policy --channel-group-name '${local.name_prefix}-cg' --channel-name '${local.name_prefix}-ch' --region '${var.aws_region}' --policy 'file://${abspath(path.module)}/.tmp-ch-policy.json'"
+  }
+}
+
+resource "terraform_data" "origin_endpoint_policy" {
+  depends_on = [aws_cloudformation_stack.mediapackage_v2, terraform_data.channel_policy]
+  triggers_replace = [local.origin_endpoint_policy_json]
+
+  provisioner "local-exec" {
+    interpreter = ["PowerShell", "-Command"]
+    command     = "[IO.File]::WriteAllText('${abspath(path.module)}/.tmp-ep-policy.json', '${replace(local.origin_endpoint_policy_json, "'", "''")}'); aws mediapackagev2 put-origin-endpoint-policy --channel-group-name '${local.name_prefix}-cg' --channel-name '${local.name_prefix}-ch' --origin-endpoint-name '${local.name_prefix}-ep' --region '${var.aws_region}' --policy 'file://${abspath(path.module)}/.tmp-ep-policy.json'"
+  }
 }
 
 #################
@@ -376,7 +361,9 @@ resource "aws_cloudformation_stack" "medialive_channel" {
   name = "${local.name_prefix}-ml-channel"
 
   depends_on = [
-    aws_cloudformation_stack.mediapackage_v2
+    aws_cloudformation_stack.mediapackage_v2,
+    aws_medialive_input.from_mediaconnect,
+    aws_cloudformation_stack.mediaconnect_flow
   ]
 
   template_body = jsonencode({
@@ -398,13 +385,10 @@ resource "aws_cloudformation_stack" "medialive_channel" {
 
           Destinations = [
             {
-              Id = "mediapackage-destination"
-              MediaPackageSettings = [
+              Id = "cmaf-destination"
+              Settings = [
                 {
-                  ChannelGroup           = aws_cloudformation_stack.mediapackage_v2.outputs["ChannelGroupName"]
-                  ChannelName            = aws_cloudformation_stack.mediapackage_v2.outputs["ChannelName"]
-                  ChannelEndpointId      = "ENDPOINT_1"
-                  MediaPackageRegionName = var.aws_region
+                  Url = aws_cloudformation_stack.mediapackage_v2.outputs["IngestUrl"]
                 }
               ]
             }
@@ -459,12 +443,15 @@ resource "aws_cloudformation_stack" "medialive_channel" {
             ]
             OutputGroups = [
               {
-                Name = "mediapackage-group"
+                Name = "cmaf-ingest-group"
                 OutputGroupSettings = {
-                  MediaPackageGroupSettings = {
+                  CmafIngestGroupSettings = {
                     Destination = {
-                      DestinationRefId = "mediapackage-destination"
+                      DestinationRefId = "cmaf-destination"
                     }
+                    NielsenId3Behavior = "NO_PASSTHROUGH"
+                    SegmentLength      = var.hls_segment_duration_seconds
+                    SegmentLengthUnits = "SECONDS"
                   }
                 }
                 Outputs = [
@@ -472,8 +459,8 @@ resource "aws_cloudformation_stack" "medialive_channel" {
                     OutputName           = "output_1080p_video"
                     VideoDescriptionName = "video_1080p"
                     OutputSettings = {
-                      MediaPackageOutputSettings = {
-                        MediaPackageV2DestinationSettings = {}
+                      CmafIngestOutputSettings = {
+                        NameModifier = "_video"
                       }
                     }
                   },
@@ -481,8 +468,8 @@ resource "aws_cloudformation_stack" "medialive_channel" {
                     OutputName            = "output_aac_audio"
                     AudioDescriptionNames = ["audio_aac"]
                     OutputSettings = {
-                      MediaPackageOutputSettings = {
-                        MediaPackageV2DestinationSettings = {}
+                      CmafIngestOutputSettings = {
+                        NameModifier = "_audio"
                       }
                     }
                   }
@@ -534,6 +521,10 @@ resource "aws_cloudfront_response_headers_policy" "hls_cors" {
 }
 
 resource "aws_cloudfront_distribution" "hls" {
+  depends_on = [
+    aws_cloudformation_stack.mediapackage_v2
+  ]
+
   enabled         = true
   is_ipv6_enabled = true
   comment         = "${local.name_prefix}-distribution"
