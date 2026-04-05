@@ -30,7 +30,7 @@
       gap: 0.5rem;
       grid-template-columns: 1fr auto;
     }
-    input {
+    input[type="text"] {
       padding: 0.55rem 0.6rem;
       border-radius: 6px;
       border: 1px solid #334155;
@@ -65,10 +65,6 @@
       gap: 0.75rem;
       grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
     }
-    .metricTitle {
-      font-weight: 700;
-      margin-bottom: 0.35rem;
-    }
     .hint {
       font-size: 0.9rem;
       color: #94a3b8;
@@ -88,15 +84,30 @@
       cursor: pointer;
       user-select: none;
     }
+    .engineBadge {
+      display: inline-block;
+      font-size: 0.75rem;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      background: #334155;
+      color: #94a3b8;
+      margin-left: 0.4rem;
+    }
+    .engineBadge.active {
+      background: #1e40af;
+      color: #e2e8f0;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>AWS Live Streaming Player (Hls.js)</h1>
+    <h1>AWS Live Streaming Player
+      <span id="engineBadge" class="engineBadge">—</span>
+    </h1>
     <p class="hint">
       Pass a playback URL with <code>?url=https://.../index.m3u8</code>
       or pass both manifests for a toggle:
-      <code>?hls=https://.../index.m3u8&amp;ll=https://.../index_ll.m3u8</code>
+      <code>?hls=https://.../index.m3u8&amp;ll=https://.../indexll.m3u8</code>
     </p>
     <div class="controls">
       <input id="manifestUrl" type="text" placeholder="https://example.cloudfront.net/index.m3u8" />
@@ -113,16 +124,22 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
+  <!-- Hls.js for standard HLS -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.15"></script>
+  <!-- Shaka Player for LL-HLS -->
+  <script src="https://cdn.jsdelivr.net/npm/shaka-player@4.16.25/dist/shaka-player.compiled.js"></script>
   <script>
     const video = document.getElementById("video");
     const manifestInput = document.getElementById("manifestUrl");
     const playBtn = document.getElementById("playBtn");
     const statusEl = document.getElementById("status");
     const analyticsEl = document.getElementById("analytics");
-    let hls;
-    let currentLevelInfo = "unknown";
+    const engineBadge = document.getElementById("engineBadge");
+
+    let hlsInstance = null;
+    let shakaInstance = null;
     let analyticsTimer = null;
+    let activeEngine = null; // "hlsjs" | "shaka"
 
     const stats = {
       startedAtMs: null,
@@ -149,90 +166,16 @@
     };
 
     const updateStatus = (message) => {
-      const playbackQuality = `CurrentABR: ${currentLevelInfo}`;
-      statusEl.textContent = `Status: ${message}\n${playbackQuality}`;
+      statusEl.textContent = `Status: ${message}`;
     };
 
-    const formatSeconds = (v) => {
+    const fmt = (v) => {
       if (!Number.isFinite(v) || v < 0) return "n/a";
       return `${v.toFixed(2)}s`;
     };
+    const fmtN = (v) => (Number.isFinite(v) ? `${Math.round(v)}` : "n/a");
 
-    const formatNumber = (v) => {
-      if (!Number.isFinite(v)) return "n/a";
-      return `${Math.round(v)}`;
-    };
-
-    const renderAnalytics = () => {
-      const mode = getSelectedMode() === "llhls" ? "LL-HLS" : "Standard HLS";
-      const nowMs = Date.now();
-      const uptimeSec = stats.startedAtMs ? (nowMs - stats.startedAtMs) / 1000 : NaN;
-
-      let latencySec = NaN;
-      let liveEdgeGapSec = NaN;
-      if (hls && typeof hls.latency === "number") latencySec = hls.latency;
-      if (hls && typeof hls.liveSyncPosition === "number" && Number.isFinite(video.currentTime)) {
-        liveEdgeGapSec = hls.liveSyncPosition - video.currentTime;
-      }
-
-      const bufferedAheadSec = (video.buffered && video.buffered.length > 0)
-        ? video.buffered.end(video.buffered.length - 1) - video.currentTime
-        : NaN;
-
-      const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
-      if (quality) {
-        stats.droppedFrames = quality.droppedVideoFrames || 0;
-        stats.totalFrames = quality.totalVideoFrames || 0;
-      }
-      const droppedRatio = stats.totalFrames > 0 ? (stats.droppedFrames / stats.totalFrames) * 100 : NaN;
-
-      analyticsEl.textContent =
-`Mode: ${mode}
-Uptime: ${formatSeconds(uptimeSec)}
-Estimated latency (hls.js): ${formatSeconds(latencySec)}
-Live edge gap: ${formatSeconds(liveEdgeGapSec)}
-Buffer ahead: ${formatSeconds(bufferedAheadSec)}
-Throughput estimate: ${formatNumber(stats.estimatedThroughputKbps)} Kbps
-Playlist reloads: ${stats.playlistReloads}
-Fragment loads: ${stats.fragmentLoads}
-Stalls: ${stats.stalls}
-Errors (fatal/recoverable): ${stats.errorFatal}/${stats.errorRecoverable}
-Dropped frames: ${stats.droppedFrames}/${stats.totalFrames} (${Number.isFinite(droppedRatio) ? droppedRatio.toFixed(2) : "n/a"}%)
-Last fragment load age: ${stats.lastFragLoadedAtMs ? formatSeconds((Date.now() - stats.lastFragLoadedAtMs) / 1000) : "n/a"}`;
-    };
-
-    const startAnalyticsTimer = () => {
-      if (analyticsTimer) clearInterval(analyticsTimer);
-      analyticsTimer = setInterval(renderAnalytics, 1000);
-    };
-
-    const setCurrentLevel = (levelObj, levelIndex) => {
-      if (!levelObj) {
-        currentLevelInfo = "auto / not selected yet";
-        return;
-      }
-      const height = levelObj.height ? `${levelObj.height}p` : "unknown-res";
-      const bitrate = formatBitrate(levelObj.bitrate);
-      currentLevelInfo = `level=${levelIndex}, resolution=${height}, bitrate=${bitrate}`;
-    };
-
-    const loadStream = (url) => {
-      if (!url) {
-        updateStatus("enter a valid HLS URL first.");
-        return;
-      }
-
-      const mode = getSelectedMode();
-      const isLLHls = mode === "llhls";
-
-      if (hls) {
-        hls.destroy();
-        hls = null;
-      }
-      if (analyticsTimer) {
-        clearInterval(analyticsTimer);
-        analyticsTimer = null;
-      }
+    const resetStats = () => {
       stats.startedAtMs = Date.now();
       stats.lastFragLoadedAtMs = null;
       stats.playlistReloads = 0;
@@ -243,95 +186,241 @@ Last fragment load age: ${stats.lastFragLoadedAtMs ? formatSeconds((Date.now() -
       stats.stalls = 0;
       stats.droppedFrames = 0;
       stats.totalFrames = 0;
+    };
 
-      if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = url;
-        updateStatus(`native HLS playback (Safari/compatible browser). Mode: ${isLLHls ? "LL-HLS" : "Standard HLS"}`);
-        startAnalyticsTimer();
-        video.play().catch(() => {
-          updateStatus("native HLS: tap play if autoplay was blocked.");
-        });
-        return;
+    const renderAnalytics = () => {
+      const isLL = getSelectedMode() === "llhls";
+      const mode = isLL ? "LL-HLS" : "Standard HLS";
+      const engine = activeEngine === "shaka" ? "Shaka Player" : "Hls.js";
+      const nowMs = Date.now();
+      const uptimeSec = stats.startedAtMs ? (nowMs - stats.startedAtMs) / 1000 : NaN;
+
+      let latencySec = NaN;
+      let liveEdgeGapSec = NaN;
+      let bufferAheadSec = NaN;
+      let trackInfo = "n/a";
+
+      if (activeEngine === "hlsjs" && hlsInstance) {
+        if (typeof hlsInstance.latency === "number") latencySec = hlsInstance.latency;
+        if (typeof hlsInstance.liveSyncPosition === "number" && Number.isFinite(video.currentTime)) {
+          liveEdgeGapSec = hlsInstance.liveSyncPosition - video.currentTime;
+        }
+        const lvl = hlsInstance.levels?.[hlsInstance.currentLevel];
+        if (lvl) trackInfo = `${lvl.height}p @ ${formatBitrate(lvl.bitrate)}`;
       }
 
-      if (!window.Hls || !window.Hls.isSupported()) {
-        updateStatus("HLS is not supported in this browser.");
-        return;
+      if (activeEngine === "shaka" && shakaInstance) {
+        const shakaStats = shakaInstance.getStats();
+        if (shakaStats) {
+          stats.estimatedThroughputKbps = (shakaStats.estimatedBandwidth || 0) / 1000;
+          stats.stalls = shakaStats.stallsDetected || stats.stalls;
+        }
+        const pres = video.getStartDate?.();
+        if (pres && pres.getTime() > 0 && Number.isFinite(video.currentTime)) {
+          const wallNow = Date.now() / 1000;
+          const presEpoch = pres.getTime() / 1000;
+          const mediaWall = presEpoch + video.currentTime;
+          latencySec = wallNow - mediaWall;
+        }
+        if (Number.isFinite(video.duration) && Number.isFinite(video.currentTime)) {
+          const seekEnd = video.seekable?.length > 0 ? video.seekable.end(video.seekable.length - 1) : NaN;
+          if (Number.isFinite(seekEnd)) liveEdgeGapSec = seekEnd - video.currentTime;
+        }
+        const tracks = shakaInstance.getVariantTracks().filter(t => t.active);
+        if (tracks.length) trackInfo = `${tracks[0].height}p @ ${formatBitrate(tracks[0].bandwidth)}`;
       }
 
-      hls = new Hls({
+      if (video.buffered?.length > 0) {
+        bufferAheadSec = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      }
+
+      const quality = video.getVideoPlaybackQuality?.();
+      if (quality) {
+        stats.droppedFrames = quality.droppedVideoFrames || 0;
+        stats.totalFrames = quality.totalVideoFrames || 0;
+      }
+      const droppedPct = stats.totalFrames > 0 ? (stats.droppedFrames / stats.totalFrames * 100) : NaN;
+
+      analyticsEl.textContent =
+`Mode: ${mode}  |  Engine: ${engine}
+Active track: ${trackInfo}
+Uptime: ${fmt(uptimeSec)}
+Estimated latency: ${fmt(latencySec)}
+Live edge gap: ${fmt(liveEdgeGapSec)}
+Buffer ahead: ${fmt(bufferAheadSec)}
+Throughput: ${fmtN(stats.estimatedThroughputKbps)} Kbps
+Playlist reloads: ${stats.playlistReloads}
+Fragment/segment loads: ${stats.fragmentLoads}
+Stalls: ${stats.stalls}
+Errors (fatal / recoverable): ${stats.errorFatal} / ${stats.errorRecoverable}
+Dropped frames: ${stats.droppedFrames}/${stats.totalFrames} (${Number.isFinite(droppedPct) ? droppedPct.toFixed(2) : "n/a"}%)`;
+    };
+
+    const startAnalyticsTimer = () => {
+      if (analyticsTimer) clearInterval(analyticsTimer);
+      analyticsTimer = setInterval(renderAnalytics, 1000);
+    };
+
+    const destroyAll = () => {
+      if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+      if (shakaInstance) { shakaInstance.destroy(); shakaInstance = null; }
+      if (analyticsTimer) { clearInterval(analyticsTimer); analyticsTimer = null; }
+      video.removeAttribute("src");
+      video.load();
+      activeEngine = null;
+    };
+
+    /* ─── Hls.js engine (standard HLS) ─── */
+    const loadWithHlsJs = (url) => {
+      if (!window.Hls?.isSupported()) {
+        updateStatus("Hls.js is not supported in this browser.");
+        return;
+      }
+      activeEngine = "hlsjs";
+      engineBadge.textContent = "Hls.js";
+      engineBadge.classList.add("active");
+
+      hlsInstance = new Hls({
         enableWorker: true,
-        lowLatencyMode: isLLHls,
+        lowLatencyMode: false,
         liveDurationInfinity: true,
-        liveSyncDurationCount: isLLHls ? 1 : 3,
-        liveMaxLatencyDurationCount: isLLHls ? 10 : 30,
-        maxLiveSyncPlaybackRate: isLLHls ? 1.2 : 1.5,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 30,
+        maxLiveSyncPlaybackRate: 1.5,
+        backBufferLength: 90,
         maxBufferLength: 30,
         maxMaxBufferLength: 120,
         startLevel: -1,
       });
 
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        updateStatus(`manifest loaded, quality levels: ${data.levels.length}`);
+      hlsInstance.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+        updateStatus(`Manifest loaded — ${data.levels.length} quality level(s).`);
         startAnalyticsTimer();
-        video.play().catch(() => {
-          updateStatus("manifest ready — tap play if autoplay was blocked.");
-        });
+        video.play().catch(() => updateStatus("Manifest ready — tap play if autoplay was blocked."));
       });
-
-      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-        const level = hls.levels[data.level];
-        setCurrentLevel(level, data.level);
-        updateStatus("playback started.");
-      });
-
-      hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
-        const level = hls.levels[data.level];
-        setCurrentLevel(level, data.level);
-        stats.playlistReloads += 1;
-        updateStatus(`playlist refreshed: ${data.details.live ? "LIVE" : "VOD"}`);
-      });
-
-      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+      hlsInstance.on(Hls.Events.LEVEL_LOADED, () => { stats.playlistReloads += 1; });
+      hlsInstance.on(Hls.Events.FRAG_LOADED, (_, data) => {
         stats.fragmentLoads += 1;
         stats.lastFragLoadedAtMs = Date.now();
-        const ms = data.stats?.loading?.end && data.stats?.loading?.first ? (data.stats.loading.end - data.stats.loading.first) : 0;
-        if (ms > 0 && data.frag?.loaded) {
-          const kbps = (data.frag.loaded * 8) / ms;
-          stats.estimatedThroughputKbps = kbps;
-        }
+        const ms = data.stats?.loading?.end && data.stats?.loading?.first
+          ? data.stats.loading.end - data.stats.loading.first : 0;
+        if (ms > 0 && data.frag?.loaded) stats.estimatedThroughputKbps = (data.frag.loaded * 8) / ms;
       });
-
-      hls.on(Hls.Events.ERROR, (_, data) => {
+      hlsInstance.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
           stats.errorFatal += 1;
-          updateStatus(`fatal error: ${data.type} / ${data.details}`);
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            hls.startLoad();
-          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            hls.recoverMediaError();
-          } else {
-            hls.destroy();
-            hls = null;
-          }
-        } else if (data.details === "bufferStalledError") {
-          stats.stalls += 1;
-          stats.errorRecoverable += 1;
-          updateStatus("buffer stalled — catching up to live edge...");
+          updateStatus(`Fatal error: ${data.type} / ${data.details}`);
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
+          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
+          else { hlsInstance.destroy(); hlsInstance = null; }
         } else {
           stats.errorRecoverable += 1;
-          updateStatus(`recoverable error: ${data.type} / ${data.details}`);
+          if (data.details === "bufferStalledError") stats.stalls += 1;
         }
       });
 
-      hls.loadSource(url);
-      hls.attachMedia(video);
+      hlsInstance.loadSource(url);
+      hlsInstance.attachMedia(video);
     };
 
-    playBtn.addEventListener("click", () => loadStream(manifestInput.value.trim()));
-    video.addEventListener("waiting", () => {
-      stats.stalls += 1;
+    /* ─── Shaka Player engine (LL-HLS) ─── */
+    const loadWithShaka = async (url) => {
+      if (!window.shaka?.Player?.isBrowserSupported()) {
+        updateStatus("Shaka Player is not supported in this browser.");
+        return;
+      }
+      activeEngine = "shaka";
+      engineBadge.textContent = "Shaka Player";
+      engineBadge.classList.add("active");
+
+      shaka.polyfill.installAll();
+      shakaInstance = new shaka.Player();
+      await shakaInstance.attach(video);
+
+      shakaInstance.configure({
+        streaming: {
+          lowLatencyMode: true,
+          inaccurateManifestTolerance: 0,
+          rebufferingGoal: 0.01,
+          segmentPrefetchLimit: 2,
+          retryParameters: {
+            baseDelay: 100,
+            maxAttempts: 6,
+          },
+          bufferingGoal: 6,
+          bufferBehind: 30,
+        },
+        manifest: {
+          hls: {
+            ignoreManifestProgramDateTime: false,
+          },
+          retryParameters: {
+            baseDelay: 100,
+            maxAttempts: 6,
+          },
+        },
+      });
+
+      shakaInstance.addEventListener("error", (e) => {
+        const detail = e.detail;
+        stats.errorFatal += 1;
+        updateStatus(`Shaka error: ${detail.code} — ${detail.message || "unknown"}`);
+        console.error("Shaka error:", detail);
+      });
+
+      shakaInstance.addEventListener("stalldetected", () => {
+        stats.stalls += 1;
+      });
+
+      shakaInstance.addEventListener("adaptation", () => {
+        stats.playlistReloads += 1;
+      });
+
+      shakaInstance.addEventListener("segmentappended", () => {
+        stats.fragmentLoads += 1;
+        stats.lastFragLoadedAtMs = Date.now();
+      });
+
+      try {
+        await shakaInstance.load(url);
+        updateStatus("LL-HLS stream loaded (Shaka Player).");
+        startAnalyticsTimer();
+        video.play().catch(() => updateStatus("Stream ready — tap play if autoplay was blocked."));
+      } catch (err) {
+        stats.errorFatal += 1;
+        updateStatus(`Shaka load error: ${err.code || ""} ${err.message}`);
+        console.error("Shaka load error:", err);
+      }
+    };
+
+    /* ─── Main loader ─── */
+    const loadStream = (url, forceMode) => {
+      if (!url) { updateStatus("Enter a valid HLS URL first."); return; }
+
+      const isLLHls = forceMode === "llhls"
+        || (forceMode !== "hls" && (url.includes("indexll") || url.includes("index_ll")));
+      const mode = isLLHls ? "llhls" : "hls";
+
+      document.querySelector(`input[name="latencyMode"][value="${mode}"]`).checked = true;
+
+      destroyAll();
+      resetStats();
+      engineBadge.classList.remove("active");
+
+      if (mode === "llhls") {
+        loadWithShaka(url);
+      } else {
+        loadWithHlsJs(url);
+      }
+    };
+
+    /* ─── Event wiring ─── */
+    playBtn.addEventListener("click", () => {
+      const url = manifestInput.value.trim();
+      const mode = getSelectedMode();
+      loadStream(url, mode);
     });
+    video.addEventListener("waiting", () => { stats.stalls += 1; });
 
     const params = new URLSearchParams(window.location.search);
     const urlParam = params.get("url");
@@ -344,21 +433,21 @@ Last fragment load age: ${stats.lastFragLoadedAtMs ? formatSeconds((Date.now() -
       if (mode === "llhls" && llUrlParam) manifestInput.value = llUrlParam;
     };
 
-    // If we got explicit URLs, drive the toggle from them.
     if (hlsUrlParam || llUrlParam) {
       applyModePresetToInput();
       document.querySelectorAll('input[name="latencyMode"]').forEach((el) => {
-        el.addEventListener("change", applyModePresetToInput);
+        el.addEventListener("change", () => {
+          const mode = getSelectedMode();
+          applyModePresetToInput();
+          loadStream(manifestInput.value.trim(), mode);
+        });
       });
     }
 
-    // Backwards compatibility: if ?url= is provided, load it directly.
     if (urlParam) {
       manifestInput.value = urlParam;
-      if (urlParam.includes("index_ll") || urlParam.includes("indexll")) {
-        document.querySelector('input[name="latencyMode"][value="llhls"]').checked = true;
-      }
-      loadStream(urlParam);
+      const autoMode = (urlParam.includes("index_ll") || urlParam.includes("indexll")) ? "llhls" : "hls";
+      loadStream(urlParam, autoMode);
     }
   </script>
 </body>

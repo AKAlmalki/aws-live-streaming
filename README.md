@@ -1,283 +1,307 @@
 # AWS Live Streaming Pipeline
 
-This project provisions and demonstrates two end-to-end AWS live streaming workflows:
+This project provisions two end-to-end AWS live streaming pipelines using **Infrastructure as Code (Terraform)** and compares standard HLS against Low-Latency HLS (LL-HLS).
 
 ![Web Player Loading a Stream](assets/screenshot-for-web-player-running-stream.png)
 
-- Ingest with AWS MediaConnect over SRT
-- Transcode with AWS MediaLive into ABR H.264 (1080p/720p/480p)
-- Package with AWS MediaPackage:
-  - Standard HLS (`terraform-hls`)
-  - LL-HLS (`terraform-ll-hls`)
-- Distribute with Amazon CloudFront
-- Play with a standalone Hls.js web player
+## What It Does
+
+| Stage | Service | Detail |
+|-------|---------|--------|
+| **Ingest** | AWS MediaConnect | SRT listener (port 5000, configurable) |
+| **Transcode** | AWS MediaLive | H.264 CBR, 1080p, 30 fps, 2-second GOP |
+| **Package** | AWS MediaPackage | v1 (HLS) or v2 (HLS + LL-HLS via CMAF) |
+| **Distribute** | Amazon CloudFront | Short-TTL manifest caching, CORS headers |
+| **Play** | Web Player | Hls.js (standard HLS) + Shaka Player (LL-HLS) |
+
+---
 
 ## Architecture
-
-High-Level View Architecture Diagram
 
 ![AWS High-Level View Architecture Diagram](assets/AWS%20Media%20Streaming%20Pipeline%20-%20High-Level%20View%20Architecture%20Diagram.png)
 
 ![AWS Detailed View Architecture Diagram](assets/AWS%20Media%20Streaming%20Pipeline%20-%20Detailed%20Architecture%20View.png)
 
+---
+
 ## Project Structure
 
-- `terraform-hls/main.tf` - core HLS pipeline (MediaPackage v1)
-- `terraform-hls/variables.tf` - HLS input variables and validation rules
-- `terraform-hls/outputs.tf` - HLS ingest/playback outputs
-- `terraform-hls/terraform.tfvars` - HLS environment values
-- `terraform-ll-hls/main.tf` - LL-HLS pipeline (MediaPackage v2 + MediaLive via CloudFormation)
-- `terraform-ll-hls/variables.tf` - LL-HLS input variables and validation rules
-- `terraform-ll-hls/outputs.tf` - LL-HLS + HLS playback outputs
-- `terraform-ll-hls/terraform.tfvars` - LL-HLS environment values
-- `web-player/index.html` - standalone Hls.js player with HLS/LL-HLS toggle and live analytics panel
-- `STUDY_GUIDE.md` - concise interview preparation notes
+```
+terraform-hls/            # Standard HLS pipeline (MediaPackage v1)
+  main.tf                 # IAM, MediaConnect, MediaLive, MediaPackage v1, CloudFront
+  variables.tf            # Input variables and validation rules
+  outputs.tf              # SRT ingest URL, CloudFront playback URL, etc.
+  terraform.tfvars        # Environment-specific overrides
 
-## Region choice for this project
+terraform-ll-hls/         # LL-HLS pipeline (MediaPackage v2)
+  main.tf                 # IAM, MediaConnect, MediaPackage v2 (CMAF), MediaLive (CMAF Ingest), CloudFront
+  variables.tf            # Input variables and validation rules
+  outputs.tf              # SRT ingest URL, HLS + LL-HLS CloudFront playback URLs
+  terraform.tfvars        # Environment-specific overrides
 
-For fair protocol comparison, both stacks are pinned to:
+web-player/
+  index.html              # Dual-engine player: Hls.js (HLS) + Shaka Player (LL-HLS), analytics panel
 
-- `aws_region = eu-west-2`
-- `mediaconnect_availability_zone = eu-west-2a`
+assets/                   # Architecture diagrams and screenshots
+```
 
-However, it would be a better option to use UAE region for running terraform-ll-hls project because it supports both LL-HLS and HLS and all of that is covered within me-central-1 (UAE) which is close to Saudi Arabia. Unfortunately, this option is not available at the moment, it will be once the terraform-ll-hls development and testing is done.
+---
 
-Why:
+## Region Choice
 
-- You need HLS and LL-HLS in the same region to compare latency fairly.
-- `me-central-1` (UAE) supports MediaPackage v2 live workflows, but the original HLS stack is MediaPackage v1-based (terraform-hls).
-- Running one protocol in UAE and the other in London introduces region/network bias.
+Both stacks use **`eu-west-2` (London)** with AZ **`eu-west-2a`**.
+
+**Why London instead of UAE (`me-central-1`)?**
+
+- The `terraform-hls` stack uses MediaPackage **v1**, which is not available in UAE.
+- Both protocols must be in the same region for a fair latency comparison.
+- UAE supports MediaPackage **v2** (LL-HLS + HLS), so `terraform-ll-hls` could run there standalone. Once the v1 stack is no longer needed for comparison, UAE would be the preferred region for proximity to Saudi Arabia.
+
+---
 
 ## Prerequisites
 
-- Windows 11 / macOS / Linux (any OS that can run Terraform CLI)
-- Terraform 1.5+
-- AWS account with permissions for MediaConnect, MediaLive, MediaPackage, IAM, CloudFront, and CloudFormation
-- AWS credentials configured (for example via `aws configure`)
-- OBS Studio (recommended) for ingest testing on your OS (Windows steps are detailed below; macOS/Linux typically use the same “Custom -> SRT” concept, or you can push SRT with `ffmpeg`)
+- **OS**: Windows 11 / macOS / Linux (any OS that runs Terraform CLI)
+- **Terraform**: 1.5+
+- **AWS account** with permissions for: MediaConnect, MediaLive, MediaPackage, IAM, CloudFront, CloudFormation
+- **AWS credentials** configured (`aws configure`, SSO, or environment variables)
+- **OBS Studio** (or `ffmpeg`) for SRT ingest
 
-Compatibility note: the AWS/Terraform parts and the `web-player` are OS-agnostic (Windows/macOS/Linux). The only OS-specific piece is how you configure/push SRT from your encoder (OBS/ffmpeg).
+> The Terraform code and the web player are fully OS-agnostic. The only OS-specific step is how you push SRT from your encoder (OBS or ffmpeg).
 
-### AWS credentials for Terraform
+### AWS Credentials for Terraform
 
-Terraform uses the same credential rules as the AWS SDK. If `terraform plan` fails with **No valid credential sources found**:
+Terraform uses the standard AWS credential chain. If `terraform plan` fails with **No valid credential sources found**:
 
-1. In the **same** terminal, run `aws sts get-caller-identity`. If that fails, fix credentials first (`aws configure`, or `aws sso login` if you use SSO). Personally, I used `aws configure` to set the access key and secret key with proper permissions and it is working.
-2. If you use a **named profile**, set it for the session before Terraform:
-  ```powershell
-   $env:AWS_PROFILE = "your-profile-name"
-   terraform plan
-  ```
-   Or set `aws_profile = "your-profile-name"` in `terraform.tfvars` (see `variables.tf`).
-3. The message about **EC2 IMDS** is normal on a laptop: Terraform tries instance metadata last and times out. It does not mean you must use EC2.
+1. Verify credentials: `aws sts get-caller-identity`. If that fails, run `aws configure`.
+2. If you use a **named profile**, set it before running Terraform:
+
+```powershell
+# PowerShell
+$env:AWS_PROFILE = "your-profile-name"
+terraform plan
+```
+
+```bash
+# bash / zsh
+export AWS_PROFILE="your-profile-name"
+terraform plan
+```
+
+Or set `aws_profile = "your-profile-name"` in `terraform.tfvars`.
+
+3. The message about **EC2 IMDS** is normal on a laptop — Terraform tries instance metadata last and times out. It does not mean you must use EC2.
+
+---
 
 ## Deploy
 
-This project pins the **HashiCorp AWS provider** to **6.38.x** (`~> 6.38` in each stack). Apply stacks separately:
+Both stacks pin the **HashiCorp AWS provider** to `~> 6.38`.
 
-```powershell
+### Standard HLS stack
+
+```bash
 cd terraform-hls
 terraform init -upgrade
-terraform plan
-terraform apply
+terraform apply -var-file="terraform.tfvars"
 ```
 
-Upgrading from provider 5.x to 6.x does not change the resources used here in a breaking way for this stack, but `init -upgrade` refreshes `.terraform.lock.hcl` and downloads the matching provider binary.
+### LL-HLS stack
 
-The MediaLive IAM role includes **MediaConnect managed** actions (`mediaconnect:ManagedDescribeFlow`, `ManagedAddOutput`, `ManagedRemoveOutput`) required when MediaLive attaches to a MediaConnect flow as an input ([MediaLive trusted entity requirements](https://docs.aws.amazon.com/medialive/latest/ug/trusted-entity-requirements.html)).
-
-Capture the generated outputs:
-
-```powershell
-terraform output srt_ingest_url
-terraform output cloudfront_playback_url
-```
-
-Deploy the LL-HLS stack separately (Not Ready Yet, Ignore it):
-
-```powershell
-cd ../terraform-ll-hls
+```bash
+cd terraform-ll-hls
 terraform init -upgrade
-terraform plan
-terraform apply
+terraform apply -var-file="terraform.tfvars"
 ```
 
-Recommended comparison workflow:
+> `init -upgrade` refreshes `.terraform.lock.hcl` and downloads the matching provider binary.
 
-1. Apply `terraform-hls` and capture `cloudfront_playback_url`.
-2. Apply `terraform-ll-hls` and capture `cloudfront_playback_url_ll_hls`.
-3. Open the web player with both URLs:
+---
 
-```text
-web-player/index.html?hls=<HLS_URL>&ll=<LL_HLS_URL>
-```
+## Start the Flow and Channel
 
-## Start Flow + Channel (after `terraform apply`)
+`terraform apply` provisions all resources but leaves MediaConnect and MediaLive in a **stopped state**. You must start them manually.
 
-`terraform apply` provisions the MediaConnect flow and the MediaLive channel configuration, but **both are left in a stopped state** in this stack.
+> **Billing warning**: MediaLive charges while the channel is running. MediaConnect and CloudFront also incur costs. Stop the channel and flow when testing is done to avoid unnecessary charges.
 
-You should:
+### 1. Start MediaConnect Flow
 
-1. Start the **MediaConnect flow** first (so it begins accepting SRT on the ingest IP/port).
-2. Start the **MediaLive channel** second (so it begins pulling from the started flow).
-
-Billing warning: **MediaLive charges while the channel is running**, and MediaConnect flow resources also incur costs. CloudFront will also generate charges for data transfer and requests. When testing is done, stop the channel/flow (for example with `aws medialive stop-channel` and `aws mediaconnect stop-flow`) to avoid unnecessary billing.
-
-Note: you can start MediaConnect flow and MediaLive channel using AWS console (if you have proper access), and the following commands for running the flow and the channel will not be necessary.
-
-
-### Windows 11 (PowerShell)
-
-1. Start MediaConnect flow
+**PowerShell (Windows):**
 
 ```powershell
-$region = "YOUR_REGION" # recommended here: eu-west-2
+$region = "eu-west-2"
 $flowArn = terraform output -raw mediaconnect_flow_arn
 aws mediaconnect start-flow --region $region --flow-arn $flowArn
 ```
 
-1. Start MediaLive channel (look up the channel id by name)
-
-```powershell
-$region = "YOUR_REGION"
-$channelName = "YOUR_CHANNEL_NAME" # ex: streaming-project-flow-channel (HLS) or streaming-project-flow-llhls-channel (LL-HLS)
-$query = "Channels[?Name=='$channelName'].Id | [0]"
-$channelId = aws medialive list-channels --region $region --max-results 100 --query $query --output text
-aws medialive start-channel --region $region --channel-id $channelId
-```
-
-### macOS / Linux (bash/zsh)
-
-1. Start MediaConnect flow
+**bash / zsh (macOS / Linux):**
 
 ```bash
-region="YOUR_REGION" # recommended here: eu-west-2
+region="eu-west-2"
 flowArn="$(terraform output -raw mediaconnect_flow_arn)"
 aws mediaconnect start-flow --region "$region" --flow-arn "$flowArn"
 ```
 
-1. Start MediaLive channel (look up channel id by name)
+### 2. Start MediaLive Channel
+
+**PowerShell (Windows):**
+
+```powershell
+$region = "eu-west-2"
+$channelName = "streaming-project-flow-channel"  # or "streaming-project-flow-llhls-channel"
+$channelId = aws medialive list-channels --region $region --max-results 100 `
+  --query "Channels[?Name=='$channelName'].Id | [0]" --output text
+aws medialive start-channel --region $region --channel-id $channelId
+```
+
+**bash / zsh (macOS / Linux):**
 
 ```bash
-region="YOUR_REGION"
-channelName="YOUR_CHANNEL_NAME" # ex: streaming-project-flow-channel (HLS) or streaming-project-flow-llhls-channel (LL-HLS)
-channelId="$(aws medialive list-channels --region "$region" --max-results 100 --query "Channels[?Name=='$channelName'].Id | [0]" --output text)"
+region="eu-west-2"
+channelName="streaming-project-flow-channel"  # or "streaming-project-flow-llhls-channel"
+channelId="$(aws medialive list-channels --region "$region" --max-results 100 \
+  --query "Channels[?Name=='$channelName'].Id | [0]" --output text)"
 aws medialive start-channel --region "$region" --channel-id "$channelId"
 ```
 
-### Check status (optional - macOS/Linux example)
+> You can also start both from the **AWS Console** if you have proper access.
+
+### 3. Stop (when done)
 
 ```bash
-aws mediaconnect describe-flow --region "$region" --flow-arn "$flowArn"
-aws medialive describe-channel --region "$region" --channel-id "$channelId"
+aws medialive stop-channel --region "$region" --channel-id "$channelId"
+aws mediaconnect stop-flow --region "$region" --flow-arn "$flowArn"
 ```
 
-## Region AZ selection (MediaConnect)
+---
 
-MediaConnect needs an **Availability Zone**. In this repo it is controlled by `mediaconnect_availability_zone` in each stack's `terraform.tfvars`.
+## OBS Studio Setup (SRT Ingest)
 
-Current values used for both stacks:
-
-- `eu-west-2` + `eu-west-2a`
-
-To list AZs for your region:
-
-```bash
-aws ec2 describe-availability-zones --region eu-west-2 --query "AvailabilityZones[].ZoneName" --output text
-```
-
-## How to Run (OBS + SRT)
-
-### 1) Verify SRT mode
-
-The default in `terraform.tfvars` is `srt_mode = "LISTENER"` (recommended for OBS pushing to AWS).
-
-### 2) Use the SRT ingest URL output
-
-For LISTENER mode, output format is:
-
-```text
-srt://<ingest-ip>:<port>?streamid=<streamid>
-```
-
-This is exported directly as `srt_ingest_url`.
-
-### 3) Configure OBS Studio
-
-1. Open **Settings -> Stream**
-2. Set **Service** to **Custom**
-3. Set protocol to **SRT** (or paste full SRT URL if your OBS version supports URL-style input)
-4. Paste the Terraform output value from `srt_ingest_url`
-5. Start streaming
+1. Get the ingest URL: `terraform output srt_ingest_url`
+   Format: `srt://<ingest-ip>:<port>?streamid=<stream-name>`
+2. In OBS: **Settings → Stream → Service: Custom → Server: paste the SRT URL**
+3. Click **Start Streaming**
 
 If video does not arrive, check:
 
-- `mediaconnect_whitelist_cidr` allows your source IP
-- local/network firewall allows outbound SRT/UDP to the ingest port
-- MediaLive channel is started in AWS (if not automatically started)
+- `mediaconnect_whitelist_cidr` allows your public IP (default is `0.0.0.0/0`)
+- Local/network firewall allows outbound UDP to the ingest port
+- MediaConnect flow and MediaLive channel are both started
 
-### 4) Play from CloudFront
+---
 
-Use:
+## Web Player
 
-- `cloudfront_playback_url` from `terraform-hls` for standard HLS.
-- `cloudfront_playback_url_ll_hls` from `terraform-ll-hls` for LL-HLS.
+The web player uses two engines:
 
-`web-player/index.html` runs on any static web server (for example VS Code’s **“Live Server”** extension). This is usually smoother than opening `file://...` URLs directly in the browser.
+| Mode | Engine | Why |
+|------|--------|-----|
+| **Standard HLS** | [Hls.js](https://github.com/video-dev/hls.js/) 1.6.15 | Mature, widely used HLS player |
+| **LL-HLS** | [Shaka Player](https://github.com/shaka-project/shaka-player) 4.16.25 | Google's player with robust LL-HLS support |
 
-The web player supports side-by-side toggle:
+### Running the Player
 
-```text
-web-player/index.html?hls=<cloudfront_playback_url from terraform-hls>&ll=<cloudfront_playback_url_ll_hls from terraform-ll-hls>
+The player is a single HTML file. Serve it with any static web server:
+
+- **Recommended**: VS Code's **"Live Server"** extension — right-click `index.html` → "Open with Live Server"
+- Any other local web server (`python -m http.server`, `npx serve`, etc.)
+
+> Opening `file://...` directly in the browser may cause CORS issues.
+
+### URL Formats
+
+**Single URL:**
+
+```
+index.html?url=https://<cloudfront-domain>/index.m3u8
 ```
 
-Use `mediapackage_hls_origin_url` / `mediapackage_ll_hls_origin_url` only for debugging (direct origin behavior/caching may differ from CloudFront).
+**Both URLs (enables radio toggle):**
+
+```
+index.html?hls=https://<cf-domain>/index.m3u8&ll=https://<cf-domain>/indexll.m3u8
+```
+
+The player auto-detects LL-HLS URLs (containing `indexll`) and switches to Shaka Player automatically.
+
+### Analytics Panel
+
+The player displays a live analytics panel with:
+
+- **Estimated latency** — glass-to-glass estimate (seconds behind live)
+- **Live edge gap** — how far behind the seekable live edge
+- **Buffer ahead** — buffered video ahead of the playback position
+- **Throughput** — estimated download bandwidth
+- **Stalls** — number of buffer underruns
+- **Dropped frames** — GPU/decoder dropped frames vs. total frames
+
+---
 
 ## Outputs Reference
 
+### `terraform-hls` Outputs
 
-| Output                        | Purpose                                                  |
-| ----------------------------- | -------------------------------------------------------- |
-| `srt_ingest_url`              | OBS ingest URL for LISTENER mode                         |
-| `srt_ingest_instructions`     | Guidance when using CALLER mode                          |
-| `cloudfront_playback_url`     | Public playback URL via CDN (standard HLS manifest)      |
-| `cloudfront_domain_name`      | CloudFront distribution domain                           |
-| `mediapackage_hls_origin_url` | Direct MediaPackage endpoint URL (standard HLS manifest) |
-| `mediaconnect_flow_arn`       | MediaConnect flow ARN                                    |
+| Output | Purpose |
+|--------|---------|
+| `srt_ingest_url` | OBS SRT ingest URL (LISTENER mode) |
+| `srt_ingest_instructions` | Guidance for CALLER mode |
+| `cloudfront_playback_url` | Public CloudFront HLS playback URL |
+| `cloudfront_domain_name` | CloudFront distribution domain |
+| `mediapackage_hls_origin_url` | Direct MediaPackage v1 endpoint (debugging only) |
+| `mediaconnect_flow_arn` | MediaConnect flow ARN |
 
+### `terraform-ll-hls` Outputs
 
-Additional outputs in `terraform-ll-hls`:
+| Output | Purpose |
+|--------|---------|
+| `srt_ingest_url` | OBS SRT ingest URL (LISTENER mode) |
+| `srt_ingest_instructions` | Guidance for CALLER mode |
+| `cloudfront_playback_url_hls` | CloudFront standard HLS playback URL |
+| `cloudfront_playback_url_ll_hls` | CloudFront LL-HLS playback URL |
+| `cloudfront_domain_name` | CloudFront distribution domain |
+| `mediapackage_hls_origin_url` | Direct MediaPackage v2 HLS endpoint (debugging only) |
+| `mediapackage_ll_hls_origin_url` | Direct MediaPackage v2 LL-HLS endpoint (debugging only) |
+| `mediaconnect_flow_arn` | MediaConnect flow ARN |
 
+---
 
-| Output                           | Purpose                                     |
-| -------------------------------- | ------------------------------------------- |
-| `cloudfront_playback_url_hls`    | Standard HLS playback URL from LL-HLS stack |
-| `cloudfront_playback_url_ll_hls` | LL-HLS playback URL from LL-HLS stack       |
-| `mediapackage_ll_hls_origin_url` | Direct MediaPackage v2 LL-HLS origin URL    |
+## Key Differences Between the Two Stacks
 
+| Aspect | `terraform-hls` | `terraform-ll-hls` |
+|--------|-----------------|---------------------|
+| MediaPackage version | v1 | v2 |
+| MediaLive output group | MediaPackage (native) | CMAF Ingest (URL-based) |
+| Container format | TS or fMP4 | CMAF (fMP4 only) |
+| LL-HLS support | No | Yes (`EXT-X-PART`, blocking reload) |
+| MediaLive resource | Terraform `aws_medialive_channel` | CloudFormation `AWS::MediaLive::Channel` |
+| Manifest tags | Standard HLS | HLS + LL-HLS (`PROGRAM-DATE-TIME`, `PART-HOLD-BACK`, `PRELOAD-HINT`) |
 
-## MediaLive configuration notes
+---
 
-The two stacks configure MediaLive differently:
+## MediaLive Configuration Notes
 
-1. `**terraform-hls**` uses Terraform resource `**[aws_medialive_channel](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/medialive_channel)**` targeting MediaPackage v1.
-2. `**terraform-ll-hls**` uses **CloudFormation `AWS::MediaLive::Channel`** because MediaPackage v2 destination settings are needed for CMAF/LL-HLS pathing.
-3. **Service rules still apply in both stacks**: for MediaPackage outputs, explicit frame rate (`framerate_control = SPECIFIED`) and pixel aspect ratio (`par_control = SPECIFIED`, 1:1) are required.
+- Frame rate is **explicitly specified** (`framerate_control = SPECIFIED`) — required for MediaPackage outputs.
+- PAR is 1:1 (`par_control = SPECIFIED`).
+- GOP size is **2 seconds** to match the 2-second segment duration.
+- Set `medialive_output_framerate_numerator` / `denominator` in `terraform.tfvars` to match your OBS output (default: 30/1 = 30 fps).
 
-Set `medialive_output_framerate_numerator` / `medialive_output_framerate_denominator` in each stack’s `terraform.tfvars` to match OBS output (for example `30` and `1` for 30 fps).
+---
+
+## HLS vs DASH (Quick Comparison)
+
+| Aspect | HLS | DASH |
+|--------|-----|------|
+| **Manifest** | `.m3u8` playlists | `.mpd` (XML) |
+| **Container** | MPEG-TS or fMP4/CMAF | fMP4/CMAF |
+| **Device support** | Strong on iOS/Safari, broad web support | Strong on Android, OTT platforms |
+| **Low-latency** | LL-HLS (Apple spec, partial segments) | Low-latency DASH (chunked CMAF) |
+| **CDN caching** | Manifest updated frequently, segments cached | Similar pattern with MPD updates |
+| **Simplicity** | Often simpler for web + mobile audiences | Simpler if you already operate a DASH toolchain |
+
+---
 
 ## Notes
 
-- `hls_segment_duration_seconds` is constrained to 2 seconds to match assignment requirements.
-- `hls_version` is informational in both stacks.
-- In `terraform-hls` (MediaPackage v1), CloudFormation `AWS::MediaPackage::OriginEndpoint` (`HlsPackage`) does not expose a direct HLS v3/v4 selector.
-- In `terraform-ll-hls` (MediaPackage v2), manifest behavior is controlled by v2 origin endpoint manifest blocks (`HlsManifests`, `LowLatencyHlsManifests`) rather than a direct v3/v4 switch.
-
-## DASH vs HLS (quick comparison)
-
-- **Manifest format**: DASH uses an `MPD` (XML) manifest; HLS uses `m3u8` playlists (`master.m3u8` + variant playlists).
-- **Common container approach**: both are commonly paired with CMAF fragmented MP4 for modern workflows; HLS also historically uses MPEG-2 TS segments.
-- **Player/device support**: HLS is very widely supported across iOS/Safari and many broadcast-oriented players; DASH is common in Android/OTT ecosystems.
-- **CDN behavior**: both work well with CDNs; HLS has many “classic” caching patterns (manifest frequently updated, segments cached), while DASH often relies on chunk/segment caching plus MPD update strategy.
-- **Latency options**: HLS can be extended toward low latency (LL-HLS); DASH can also be chunked for lower latency, but implementation details vary heavily by packager/CDN/player.
-- **Operational complexity**: HLS is often simpler to deploy for “web + mobile browser” audiences; DASH can be simpler if you already operate a DASH+CMAF toolchain.
+- `hls_segment_duration_seconds` is fixed at **2 seconds** per assignment requirements.
+- The `terraform-ll-hls` stack applies MediaPackage v2 resource policies via AWS CLI (`local-exec`) rather than CloudFormation, due to CloudFormation JSON serialization issues with policy documents.
+- The `hls_version` variable is informational only — neither MediaPackage v1 nor v2 exposes a direct HLS v3/v4 selector in their CloudFormation resources.
